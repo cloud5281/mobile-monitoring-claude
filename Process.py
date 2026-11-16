@@ -1,0 +1,288 @@
+import logging
+import re
+import threading
+import queue
+import time
+from datetime import datetime
+from Procedure.GPSReader import GPSReader
+from Procedure.PIDReader import PIDReader
+from Procedure.TSIReader import TSIReader
+from Procedure.WindReader import WindReader
+from Procedure.FirebaseManager import FirebaseManager
+from Procedure.CameraReader import CameraReader
+from Procedure.BackupManager import BackupManager
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_dirname(name):
+    """專案名稱要拿來當資料夾名稱：把 Windows 不允許的字元換成底線，避免建檔失敗或跑到別的資料夾"""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip(" .")
+    return cleaned or "project"
+
+class RunProcedures:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.timeout_limit = 60
+        self.merger_thread = None
+        self.running = False
+        self._is_stopping = False
+
+        self.gps = GPSReader()
+        self.gps.wifi_ip = self.cfg.GPS_IP
+        self.gps.port = self.cfg.GPS_PORT  
+        self.gps.timeout_limit = self.timeout_limit
+        self.gps.gps_queue = self.cfg.GPS_QUEUE
+
+        if self.cfg.CONC_INSTRUMENT == 'PID':
+            self.conc = PIDReader()
+            self.conc.serial_port = self.cfg.CONC_SERIAL_PORT
+            self.conc.baud_rate = self.cfg.CONC_BAUDRATE
+        elif self.cfg.CONC_INSTRUMENT == 'TSI':
+            self.conc = TSIReader()
+            self.conc.ip = self.cfg.CONC_IP
+            self.conc.port = self.cfg.CONC_PORT
+        else:
+            raise ValueError(f"不支援的濃度儀器: {self.cfg.CONC_INSTRUMENT}")
+        self.conc.unit = self.cfg.CONC_UNIT
+        self.conc.timeout_limit = self.timeout_limit
+        self.conc.conc_queue = self.cfg.CONC_QUEUE
+
+        self.wind = WindReader()
+        self.wind.update_interval = 300
+        self.wind.api_key = self.cfg.WIND_API_KEY
+        self.wind.wind_queue = self.cfg.WIND_QUEUE
+
+        self.fb = FirebaseManager(
+            key_path=self.cfg.FIREBASE_KEY, 
+            db_url=self.cfg.DB_URL
+        )
+        
+        self.backup = BackupManager()
+        self.backup.save_dir = str(self.cfg.BASE_DIR / "backups" / _safe_dirname(self.cfg.PROJECT_NAME))
+        self._backup_retry_at = 0.0
+        self.is_backup_started = False
+
+        self.fb.project_name = self.cfg.PROJECT_NAME
+        self.fb.data_queue = self.cfg.SHARED_QUEUE 
+
+        self.camera = None
+        if self.cfg.CAMERA_ENABLED:
+            self.camera = CameraReader(
+                camera_index=self.cfg.CAMERA_INDEX, 
+                cooldown=1.0
+            )
+            self.camera.threshold = self.cfg.CAMERA_THRESHOLD
+            self.camera.save_dir = str(self.cfg.BASE_DIR / "events_photos" / _safe_dirname(self.cfg.PROJECT_NAME))
+            self.camera.camera_queue = self.cfg.CAMERA_QUEUE
+
+    def _ensure_backup_active(self):
+        if self.is_backup_started:
+            return
+        now = time.time()
+        if now < self._backup_retry_at:
+            return
+        if self.backup.start():
+            self.is_backup_started = True
+        else:
+            self._backup_retry_at = now + 10   # 失敗時 10 秒後再試，避免每筆都刷錯誤
+
+    def _queue_merger(self):
+        latest_conc_cache = {
+            'val': None, 
+            'unit': self.conc.unit if hasattr(self.conc, 'unit') else '', 
+            'last_update': time.time()
+        }
+
+        latest_wind_cache = {
+            "測站名稱": "",
+            "觀測時間": "",
+            "風速": None, 
+            "風向": None,
+            "溫度": None,  
+            "濕度": None
+        }
+        
+
+        SENSOR_TIMEOUT_SEC = 5.0
+        last_gps_arrival_time = time.time()
+        last_upload_time = time.time()
+        GPS_GRACE_PERIOD = 5.0 
+        last_processed_ts = ""
+        
+        # 🔥 新增：儲存 GPS 資料的緩衝區，用於時間延遲匹配
+        gps_buffer = []
+        wind_started = False
+
+        while self.running:
+            try:
+                # --- A1. 更新濃度緩存 ---
+                conc_alive = True
+                while not self.conc.conc_queue.empty():
+                    try:
+                        c_data = self.conc.conc_queue.get_nowait()
+                        if c_data is None:
+                            if self.running:
+                                self.fb.data_queue.put(None)
+                            conc_alive = False
+                            self.running = False 
+                            break
+                        latest_conc_cache['val'] = c_data['conc']
+                        if 'unit' in c_data: latest_conc_cache['unit'] = c_data['unit']
+                        latest_conc_cache['last_update'] = time.time()
+
+                        if self.running and c_data['conc'] is not None and self.camera:
+                            self.cfg.CAMERA_QUEUE.put(c_data['conc'])
+
+                    except queue.Empty:
+                        break
+                if not conc_alive: break
+
+                # --- A2. 更新風場緩存 ---
+                while not self.wind.wind_queue.empty():
+                    try:
+                        w_data = self.wind.wind_queue.get_nowait()
+                        if w_data is not None:
+                            latest_wind_cache.update(w_data)
+                    except queue.Empty:
+                        break
+                
+                # --- B. 處理 GPS 與緩衝區寫入 ---
+                try:
+                    gps_data = self.gps.gps_queue.get(timeout=0.1)
+                    
+                    if gps_data is None:
+                        if self.running: self.fb.data_queue.put(None)
+                        break
+
+                    # 過濾重複時間戳
+                    current_ts = gps_data.get('timestamp', '')
+                    if current_ts != last_processed_ts:
+                        last_processed_ts = current_ts
+                        
+                        # 🔥 把 GPS 座標加入緩衝區，並記錄進入系統的精準時間
+                        gps_buffer.append({'sys_time': time.time(), 'data': gps_data})
+                        last_gps_arrival_time = time.time() 
+
+                except queue.Empty:
+                    pass
+
+                # --- C. 取出已達延遲時間的 GPS 進行配對 ---
+                current_time = time.time()
+                # 扣除設定的延遲時間 (秒)
+                target_time = current_time - self.cfg.TIME_DELAY
+                
+                # 若緩衝區有資料，且其系統進入時間小於等於目標時間，代表它「熟成」了
+                while len(gps_buffer) > 0 and gps_buffer[0]['sys_time'] <= target_time:
+                    delayed_gps_data = gps_buffer.pop(0)['data']
+                    
+                    if delayed_gps_data['lat'] is not None and delayed_gps_data['lon'] is not None:
+                        self.wind.latest_loc = [delayed_gps_data['lat'], delayed_gps_data['lon']]
+
+                        if not wind_started:
+                            self.wind.run()
+                            wind_started = True
+
+                    # 🔥 將 N 秒前的 GPS 座標，與「當下最新」的濃度匹配
+                    delayed_gps_data['conc'] = latest_conc_cache['val']
+                    delayed_gps_data['conc_unit'] = latest_conc_cache['unit']
+
+                    delayed_gps_data['station_name'] = latest_wind_cache.get('測站名稱', '')
+                    delayed_gps_data['wind_time'] = latest_wind_cache.get('觀測時間', '')
+                    delayed_gps_data['wind_speed'] = latest_wind_cache.get('風速')
+                    delayed_gps_data['wind_dir'] = latest_wind_cache.get('風向')
+                    delayed_gps_data['temperature'] = latest_wind_cache.get('溫度')
+                    delayed_gps_data['humidity'] = latest_wind_cache.get('濕度')
+                    
+                    time_diff = current_time - latest_conc_cache['last_update']
+                    if latest_conc_cache['val'] is None and time_diff <= SENSOR_TIMEOUT_SEC:
+                        delayed_gps_data['status'] = 'Connecting'
+                    elif time_diff > SENSOR_TIMEOUT_SEC:
+                        delayed_gps_data['status'] = 'Conc Lost'
+                        delayed_gps_data['conc'] = None
+                    
+                    self.fb.data_queue.put(delayed_gps_data)
+                    self._ensure_backup_active()
+                    self.backup.write(delayed_gps_data)
+                    
+                    last_upload_time = current_time
+
+                # === 處理 GPS 遺失狀況 (緩衝區為空且超時) ===
+                if len(gps_buffer) == 0:
+                    is_gps_really_lost = (current_time - last_gps_arrival_time > GPS_GRACE_PERIOD)
+                    is_time_to_fill = (current_time - last_upload_time >= 1.0)
+
+                    if is_gps_really_lost and is_time_to_fill:
+                        now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        no_gps_data = {
+                            "timestamp": now_str,
+                            "lat": None, 
+                            "lon": None, 
+                            "alt": None,
+                            "status": "GPS Lost",
+                            "conc": latest_conc_cache['val'],
+                            "conc_unit": latest_conc_cache['unit'],
+                            "station_name": latest_wind_cache.get('測站名稱', ''),
+                            "wind_time": latest_wind_cache.get('觀測時間', ''),
+                            "wind_speed": latest_wind_cache.get('風速'),
+                            "wind_dir": latest_wind_cache.get('風向'),
+                            "temperature": latest_wind_cache.get('溫度'), 
+                            "humidity": latest_wind_cache.get('濕度')     
+                        }
+                        
+                        time_diff = current_time - latest_conc_cache['last_update']
+                        if latest_conc_cache['val'] is None and time_diff <= SENSOR_TIMEOUT_SEC:
+                            no_gps_data['status'] = 'Connecting'
+                        elif time_diff > SENSOR_TIMEOUT_SEC:
+                            no_gps_data['status'] = 'All Lost'
+
+                        self.fb.data_queue.put(no_gps_data)
+                        self._ensure_backup_active()
+                        self.backup.write(no_gps_data)
+                        
+                        last_upload_time = current_time
+
+            except Exception as e:
+                logger.error(f"合併程序錯誤: {e}")
+                time.sleep(1)
+
+        if self.running:
+            self.fb.data_queue.put(None)
+
+    def stop(self):
+        if self._is_stopping:
+            return
+        self._is_stopping = True
+        
+        self.running = False
+        self.fb.stop()
+        self.gps.stop()
+        self.conc.stop() 
+        self.wind.stop()
+        if self.camera:            
+            self.camera.stop()        
+        if self.is_backup_started:
+            self.backup.stop()
+            self.is_backup_started = False
+        if self.merger_thread and self.merger_thread.is_alive():
+            self.merger_thread.join(timeout=2.0)
+   
+    def run(self):
+        self.running = True
+        logger.info("---程式開始---")
+
+        self.conc.run()
+        self.gps.run()
+        # self.wind.run()      
+        if self.camera:           
+            self.camera.run()
+
+        self.merger_thread = threading.Thread(target=self._queue_merger, daemon=True)
+        self.merger_thread.start()
+
+        try:
+            self.fb.run()
+        finally:
+            self.stop()   
+            self.running = False
